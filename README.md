@@ -111,6 +111,10 @@ git branch -D agent1 agent2 agent3
 rm -rf .syncgit
 ```
 
+## Stewardship
+
+syncgit is stewarded by [templesofrefuge.earth](https://templesofrefuge.earth) and is part of the [syncengine.earth](https://syncengine.earth) project — an expression of the same flat-protocol, no-hub ethos applied to code coordination.
+
 ## License
 
 MIT © Truman Ellis
