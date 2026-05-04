@@ -1,0 +1,37 @@
+# Sample .syncgit/ignore — patterns to skip when staging.
+# `syncgit stage` shows this as hints to the agent.
+# These are advisory, not enforced — the agent decides what to commit.
+
+# Build artifacts
+dist/
+build/
+target/
+*.pyc
+*.o
+*.class
+
+# Logs and scratch
+*.log
+*.tmp
+.syncgit/last-halt.md
+.syncgit/lock/
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Large data
+*.zip
+*.tar.gz
+*.sqlite

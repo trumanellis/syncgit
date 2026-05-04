@@ -2,7 +2,7 @@
 # syncgit — peer-worktree VCS over git refs
 #
 # Subcommands: init, peers, status, fetch, stage, merge, verify, push, gc,
-#              show, abort, squash
+#              show, abort, squash, unlock
 #
 # Layout: a parent dir contains one shared git repo plus N worktree dirs, one
 # per peer. .syncgit/peers.json at the parent lists the peers. Each worktree
@@ -15,9 +15,11 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 . "$here/lib.sh"
 
+version="$(cat "$here/../VERSION" 2>/dev/null || echo "unknown")"
+
 usage() {
   cat <<EOF
-syncgit <command> [args]
+syncgit [-q|--quiet] [-v|--verbose] <command> [args]
 
   init --peers a,b,c       create parent + N worktrees, wire remotes
   peers list|add|remove    manage peer set
@@ -31,26 +33,48 @@ syncgit <command> [args]
   show <ref>               log + diffstat of <ref> relative to HEAD
   abort                    roll back to pre-merge snapshot
   squash                   collapse self-authored commits since last push into one
+  unlock                   remove a stale .syncgit/lock directory
+  --version, -V            print version and exit
 EOF
 }
 
+# Per-subcommand help printer.
+# Usage: syncgit_subhelp <name> <one-line-summary> <body>
+syncgit_subhelp() {
+  cat >&2 <<EOF
+syncgit $1 — $2
+$3
+EOF
+  exit 0
+}
+
 cmd_init() {
+  case "${1:-}" in -h|--help)
+    syncgit_subhelp init "create parent + N worktrees, wire remotes" \
+"Usage: syncgit init --peers <id>[,<id>...]
+
+  --peers <csv>   comma-separated (or space-separated) list of peer ids
+                  each id: 1-64 chars, alphanumeric + - + _, not starting with - or _
+
+Idempotent: safe to re-run if worktrees already exist."
+  ;; esac
+
   local peers_csv=""
   local in_peers=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --peers) in_peers=1; shift ;;
-      --*) echo "init: unknown arg $1" >&2; exit 1 ;;
+      --*) echo "syncgit: init: unknown arg $1" >&2; exit 1 ;;
       *)
         if [[ $in_peers -eq 1 ]]; then
           peers_csv="${peers_csv:+$peers_csv,}$1"
         else
-          echo "init: unexpected arg $1 (use --peers a,b,c or --peers a b c)" >&2; exit 1
+          echo "syncgit: init: unexpected arg $1 (use --peers a,b,c or --peers a b c)" >&2; exit 1
         fi
         shift ;;
     esac
   done
-  [[ -n "$peers_csv" ]] || { echo "init: --peers required" >&2; exit 1; }
+  [[ -n "$peers_csv" ]] || { echo "syncgit: init: --peers required" >&2; exit 1; }
   # normalize: split any commas the user included, then rejoin
   peers_csv="$(echo "$peers_csv" | tr ',' '\n' | awk 'NF' | paste -sd, -)"
 
@@ -67,6 +91,13 @@ cmd_init() {
   (cd "$root" && git worktree prune)
 
   mkdir -p "$root/.syncgit"
+
+  IFS=',' read -ra ids <<< "$peers_csv"
+  # validate peer ids before creating anything
+  for id in "${ids[@]}"; do
+    syncgit_validate_id "$id" "init"
+  done
+
   # build peers.json
   python3 - "$root/.syncgit/peers.json" "$peers_csv" <<'PY'
 import json, sys
@@ -77,7 +108,6 @@ with open(path, "w") as f:
     json.dump(peers, f, indent=2)
 PY
 
-  IFS=',' read -ra ids <<< "$peers_csv"
   # create worktrees
   for id in "${ids[@]}"; do
     if [[ -d "$root/$id" ]]; then
@@ -104,23 +134,239 @@ PY
       (cd "$root/$id" && git remote add "peer-$peer" "../$peer")
     done
   done
-  echo "syncgit: initialized $root with peers: ${peers_csv}"
+  syncgit_log info "initialized $root with peers: ${peers_csv}"
 }
 
 cmd_peers() {
+  case "${1:-}" in -h|--help)
+    syncgit_subhelp peers "manage peer set" \
+"Usage: syncgit peers <subcommand> [args]
+
+  list              list all peers (default)
+  add <id>          add a new peer worktree and wire remotes
+  remove <id>       remove a peer worktree and unwire remotes
+
+Run from anywhere inside the syncgit tree."
+  ;; esac
+
   local sub="${1:-list}"
+  shift || true
   case "$sub" in
     list)
       syncgit_peers
       ;;
+    add)
+      _peers_add "$@"
+      ;;
+    remove)
+      _peers_remove "$@"
+      ;;
     *)
-      echo "peers: $sub not yet implemented (edit .syncgit/peers.json and re-init)" >&2
+      echo "syncgit: peers: unknown subcommand '$sub' (list|add|remove)" >&2
       exit 1
       ;;
   esac
 }
 
+_peers_add() {
+  local id="${1:-}"
+  if [[ -z "$id" ]]; then
+    echo "syncgit: peers: add requires an id" >&2
+    exit 1
+  fi
+
+  # Validate id
+  syncgit_validate_id "$id" "peers"
+
+  local root
+  root="$(syncgit_parent_root)"
+
+  # Check if already present
+  local already
+  already="$(python3 - "$root/.syncgit/peers.json" "$id" <<'PY'
+import json, sys
+path, new_id = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    peers = json.load(f)
+print("yes" if any(p["id"] == new_id for p in peers) else "no")
+PY
+)"
+  if [[ "$already" == "yes" ]]; then
+    echo "syncgit: peers: '$id' already exists" >&2
+    exit 1
+  fi
+
+  # Append to peers.json
+  python3 - "$root/.syncgit/peers.json" "$id" <<'PY'
+import json, sys
+path, new_id = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    peers = json.load(f)
+peers.append({"id": new_id, "path": new_id})
+with open(path, "w") as f:
+    json.dump(peers, f, indent=2)
+PY
+
+  # Create worktree
+  if [[ ! -d "$root/$id" ]]; then
+    if (cd "$root" && git show-ref --verify --quiet "refs/heads/$id"); then
+      (cd "$root" && git worktree add -q "$id" "$id")
+    else
+      (cd "$root" && git worktree add -q "$id" -b "$id")
+    fi
+  fi
+
+  # Write self file, copy peers.json, set git identity
+  mkdir -p "$root/$id/.syncgit"
+  printf '%s' "$id" > "$root/$id/.syncgit/self"
+  cp "$root/.syncgit/peers.json" "$root/$id/.syncgit/peers.json"
+  (cd "$root/$id" && git config --worktree user.name "$id" && git config --worktree user.email "$id@syncgit.local")
+
+  # Collect existing peers (all peers minus the new one)
+  local -a existing_ids=()
+  while IFS=$'\t' read -r eid _; do
+    existing_ids+=("$eid")
+  done < <(python3 - "$root/.syncgit/peers.json" "$id" <<'PY'
+import json, sys
+path, skip = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    peers = json.load(f)
+for p in peers:
+    if p["id"] != skip:
+        print(f"{p['id']}\t{p['path']}")
+PY
+)
+
+  # Wire new peer's remotes to every existing peer
+  for eid in "${existing_ids[@]}"; do
+    (cd "$root/$id" && git remote remove "peer-$eid" 2>/dev/null || true)
+    (cd "$root/$id" && git remote add "peer-$eid" "../$eid")
+  done
+
+  # Wire every existing peer's worktree to point at the new peer
+  for eid in "${existing_ids[@]}"; do
+    if [[ -d "$root/$eid" ]]; then
+      (cd "$root/$eid" && git remote remove "peer-$id" 2>/dev/null || true)
+      (cd "$root/$eid" && git remote add "peer-$id" "../$id")
+      # Update each peer's peers.json copy too
+      cp "$root/.syncgit/peers.json" "$root/$eid/.syncgit/peers.json"
+    fi
+  done
+
+  syncgit_log info "added peer '$id'"
+}
+
+_peers_remove() {
+  local id="${1:-}"
+  if [[ -z "$id" ]]; then
+    echo "syncgit: peers: remove requires an id" >&2
+    exit 1
+  fi
+
+  local root
+  root="$(syncgit_parent_root)"
+
+  # Check present
+  local present
+  present="$(python3 - "$root/.syncgit/peers.json" "$id" <<'PY'
+import json, sys
+path, rem_id = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    peers = json.load(f)
+print("yes" if any(p["id"] == rem_id for p in peers) else "no")
+PY
+)"
+  if [[ "$present" != "yes" ]]; then
+    echo "syncgit: peers: '$id' not found" >&2
+    exit 1
+  fi
+
+  # Refuse to remove self
+  local self
+  self="$(syncgit_self_id)"
+  if [[ "$id" == "$self" ]]; then
+    echo "syncgit: peers: cannot remove self" >&2
+    exit 1
+  fi
+
+  # Remove from peers.json
+  python3 - "$root/.syncgit/peers.json" "$id" <<'PY'
+import json, sys
+path, rem_id = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    peers = json.load(f)
+peers = [p for p in peers if p["id"] != rem_id]
+with open(path, "w") as f:
+    json.dump(peers, f, indent=2)
+PY
+
+  # Check for uncommitted tracked changes before removing worktree.
+  # Untracked files (e.g. .syncgit/) are always present and safe to force-remove.
+  if [[ -d "$root/$id" ]]; then
+    if ! (cd "$root/$id" && git diff --quiet && git diff --cached --quiet) 2>/dev/null; then
+      echo "syncgit: peers: worktree '$id' has uncommitted tracked changes" >&2
+      echo "  Commit or stash first, or if you are sure:" >&2
+      echo "    (cd '$root' && git worktree remove --force '$id')" >&2
+      # Restore peers.json entry since we failed
+      python3 - "$root/.syncgit/peers.json" "$id" <<'PY'
+import json, sys
+path, add_id = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    peers = json.load(f)
+if not any(p["id"] == add_id for p in peers):
+    peers.append({"id": add_id, "path": add_id})
+with open(path, "w") as f:
+    json.dump(peers, f, indent=2)
+PY
+      exit 1
+    fi
+  fi
+  # Use --force to handle untracked .syncgit/ metadata files (always present).
+  if ! (cd "$root" && git worktree remove --force "$id" 2>/dev/null); then
+    echo "syncgit: peers: could not remove worktree '$id'" >&2
+    # Restore peers.json entry since we failed
+    python3 - "$root/.syncgit/peers.json" "$id" <<'PY'
+import json, sys
+path, add_id = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    peers = json.load(f)
+if not any(p["id"] == add_id for p in peers):
+    peers.append({"id": add_id, "path": add_id})
+with open(path, "w") as f:
+    json.dump(peers, f, indent=2)
+PY
+    exit 1
+  fi
+
+  # Remove peer-<id> remote from every remaining peer's worktree and update peers.json copies
+  while IFS=$'\t' read -r eid _; do
+    if [[ -d "$root/$eid" ]]; then
+      (cd "$root/$eid" && git remote remove "peer-$id" 2>/dev/null || true)
+      cp "$root/.syncgit/peers.json" "$root/$eid/.syncgit/peers.json"
+    fi
+  done < <(python3 - "$root/.syncgit/peers.json" "$self" <<'PY'
+import json, sys
+path, self_id = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    peers = json.load(f)
+for p in peers:
+    if p["id"] != self_id:
+        print(f"{p['id']}\t{p['path']}")
+PY
+)
+
+  syncgit_log info "removed peer '$id'"
+}
+
 cmd_fetch() {
+  case "${1:-}" in -h|--help)
+    syncgit_subhelp fetch "fetch refs/pr/* from every peer" \
+"Usage: syncgit fetch
+
+Currently a no-op for local-only setups (all worktrees share one ref database).
+When network transport is added, this will run 'git fetch peer-*' to pull
+inbound refs/pr/<peer>/<ts> from remote peers."
+  ;; esac
   # Future network-transport seam. Currently a no-op because all worktrees
   # share the same ref database — a `git push peer-x HEAD:refs/pr/...` already
   # makes the ref visible in every worktree without any explicit fetch step.
@@ -159,26 +405,108 @@ syncgit_pending() {
 }
 
 cmd_status() {
-  echo "self: $(syncgit_self_id)   root: $(syncgit_root)"
+  case "${1:-}" in -h|--help)
+    syncgit_subhelp status "show inbound/outbound PR queue" \
+"Usage: syncgit status
+
+Shows:
+  - self id, root path, version
+  - peer list
+  - inbound PRs not yet merged, with pending count and oldest-ref age
+  - outbound PRs you have broadcast, with unbroadcast count and last-broadcast age"
+  ;; esac
+
+  local self root_path
+  self="$(syncgit_self_id)"
+  root_path="$(syncgit_root)"
+  echo "self: $self   root: $root_path   version: $version"
   echo
   echo "peers:"
   syncgit_peers | sed 's/^/  /'
   echo
-  echo "inbound PRs (not yet merged into HEAD):"
+
+  # Inbound PRs with count + oldest age
   local pending
-  pending="$(syncgit_pending || true)"
+  pending="$(syncgit_pending)"
   if [[ -z "$pending" ]]; then
+    echo "inbound PRs (none):"
     echo "  (none)"
   else
+    local count oldest_ts oldest_age
+    count="$(echo "$pending" | wc -l | tr -d ' ')"
+    # oldest ts is the first line's ref (refs/pr/<id>/<ts>), extract ts suffix
+    oldest_ts="$(echo "$pending" | head -1 | awk -F'\t' '{print $2}' | awk -F/ '{print $NF}')"
+    oldest_age="$(python3 - "$oldest_ts" <<'PY'
+import sys, re
+from datetime import datetime, timezone
+ts = sys.argv[1]
+# strip random suffix: 20240101T120000Z-abc123 -> 20240101T120000Z
+ts_clean = re.sub(r'-[a-z0-9]{6}$', '', ts)
+try:
+    dt = datetime.strptime(ts_clean, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+    diff = datetime.now(timezone.utc) - dt
+    s = int(diff.total_seconds())
+    if s < 3600:
+        print(f"{s//60}m ago")
+    elif s < 86400:
+        print(f"{s//3600}h ago")
+    else:
+        print(f"{s//86400}d ago")
+except Exception:
+    print("unknown")
+PY
+)"
+    echo "inbound PRs ($count pending, oldest $oldest_age):"
     echo "$pending" | awk -F'\t' '{printf "  %s  %s\n", substr($1,1,10), $2}'
   fi
   echo
-  echo "outbound PRs (refs/pr/$(syncgit_self_id)/*):"
-  git for-each-ref --format='  %(objectname:short)  %(refname)' \
-    "refs/pr/$(syncgit_self_id)/" || true
+
+  # Outbound PRs with unbroadcast count + last-broadcast age
+  local outbound
+  outbound="$(git for-each-ref --format='%(objectname:short)  %(refname)' "refs/pr/$self/" 2>/dev/null || true)"
+  if [[ -z "$outbound" ]]; then
+    echo "outbound PRs (refs/pr/$self/*) (none):"
+    echo "  (none)"
+  else
+    # newest ts = last broadcast (sort refs lexicographically, take last)
+    local newest_ts newest_age
+    newest_ts="$(git for-each-ref --format='%(refname)' "refs/pr/$self/" \
+      | awk -F/ '{print $NF}' | sort | tail -1)"
+    newest_age="$(python3 - "$newest_ts" <<'PY'
+import sys, re
+from datetime import datetime, timezone
+ts = sys.argv[1]
+ts_clean = re.sub(r'-[a-z0-9]{6}$', '', ts)
+try:
+    dt = datetime.strptime(ts_clean, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+    diff = datetime.now(timezone.utc) - dt
+    s = int(diff.total_seconds())
+    if s < 3600:
+        print(f"{s//60}m ago")
+    elif s < 86400:
+        print(f"{s//3600}h ago")
+    else:
+        print(f"{s//86400}d ago")
+except Exception:
+    print("unknown")
+PY
+)"
+    # Count outbound refs not yet absorbed (unbroadcast = those with no peers to absorb)
+    local out_count
+    out_count="$(echo "$outbound" | wc -l | tr -d ' ')"
+    echo "outbound PRs (refs/pr/$self/*) ($out_count broadcast, last $newest_age):"
+    echo "$outbound" | sed 's/^/  /'
+  fi
 }
 
 cmd_stage() {
+  case "${1:-}" in -h|--help)
+    syncgit_subhelp stage "show a categorized diff for agent review" \
+"Usage: syncgit stage
+
+Prints git status (short), unstaged diff stats, and any .syncgit/ignore hints.
+Designed for agent consumption to decide what to 'git add'."
+  ;; esac
   echo "# Untracked / modified (agent: git add only the ones that are real work)"
   git status --short
   echo
@@ -193,12 +521,20 @@ cmd_stage() {
 }
 
 cmd_merge() {
+  case "${1:-}" in -h|--help)
+    syncgit_subhelp merge "rebase through pending peer PRs" \
+"Strategies (set via SYNCGIT_MERGE_STRATEGY env):
+  merge   (default)  preserves all peer SHAs via merge-commit chain
+  rebase             linear, only last peer's SHA survives
+
+On conflict: exits 3 with recovery instructions. Use 'syncgit abort' to roll back."
+  ;; esac
   syncgit_lock
   cmd_fetch
   local pending
-  pending="$(syncgit_pending || true)"
+  pending="$(syncgit_pending)"
   if [[ -z "$pending" ]]; then
-    echo "syncgit: no pending peer PRs"
+    syncgit_log info "no pending peer PRs"
     return 0
   fi
   # Refuse to clobber an existing snapshot — a previous merge is in flight.
@@ -266,9 +602,15 @@ syncgit_merge_via_chain() {
   local local_base
   if ! local_base="$(git merge-base --octopus "$local_tip" "${peer_shas[@]}" 2>/dev/null)"; then
     local_base="$local_tip"
-    local s
     for s in "${peer_shas[@]}"; do
-      local_base="$(git merge-base "$local_base" "$s")"
+      local next_base
+      if ! next_base="$(git merge-base "$local_base" "$s" 2>/dev/null)"; then
+        echo "syncgit: merge: disjoint history detected — peer ref $s shares no common ancestor with HEAD" >&2
+        echo "  This typically means a peer was bootstrapped from a different seed commit." >&2
+        echo "  Resolve manually or remove the offending peer ref." >&2
+        exit 1
+      fi
+      local_base="$next_base"
     done
   fi
 
@@ -339,13 +681,20 @@ syncgit_merge_via_chain() {
 }
 
 cmd_verify() {
+  case "${1:-}" in -h|--help)
+    syncgit_subhelp verify "run .syncgit/verify.sh if present" \
+"Usage: syncgit verify
+
+Runs <worktree>/.syncgit/verify.sh if executable. Treats absence as pass.
+Useful for custom test suites or lint checks before push."
+  ;; esac
   syncgit_lock
   local top
   top="$(git rev-parse --show-toplevel)"
   if [[ -x "$top/.syncgit/verify.sh" ]]; then
     (cd "$top" && ./.syncgit/verify.sh)
   else
-    echo "syncgit: no .syncgit/verify.sh (treating as pass)"
+    syncgit_log info "no .syncgit/verify.sh (treating as pass)"
   fi
 }
 
@@ -357,19 +706,29 @@ syncgit_gc() {
   local self
   self="$(syncgit_self_id)"
 
-  # Pass 1: drop our own refs absorbed by all peers
+  # Pass 1: drop our own refs absorbed by all peers.
+  #
+  # NOTE: This reads `refs/heads/<id>` to detect "absorbed by peer". This works
+  # ONLY because all peer worktrees share one git ref database (the local-only
+  # design). When network transport is added (see cmd_fetch), this must change
+  # to read `refs/remotes/peer-<id>/<id>` (the post-fetch landing spot) or
+  # an equivalent cached view of the remote peer's branch tip. Without that
+  # change, GC pass-1 will silently produce wrong answers under network mode
+  # because peer's local branch refs won't exist locally.
   while IFS= read -r localref; do
     local sha; sha="$(git rev-parse "$localref")"
+    local saw_any_peer=0
     local absorbed=1
     while IFS=$'\t' read -r id _; do
+      saw_any_peer=1
       local peer_head
       peer_head="$(git rev-parse --verify --quiet "refs/heads/$id" 2>/dev/null || echo "")"
       if [[ -z "$peer_head" ]] || ! git merge-base --is-ancestor "$sha" "$peer_head" 2>/dev/null; then
         absorbed=0; break
       fi
     done < <(syncgit_peers)
-    if [[ "$absorbed" == 1 ]]; then
-      echo "syncgit: GC $localref (absorbed by all peers)"
+    if [[ "$saw_any_peer" == 1 && "$absorbed" == 1 ]]; then
+      syncgit_log info "GC $localref (absorbed by all peers)"
       git update-ref -d "$localref"
     fi
   done < <(git for-each-ref --format='%(refname)' "refs/pr/$self/")
@@ -383,7 +742,7 @@ syncgit_gc() {
     [[ "$ref_id" == "$self" ]] && continue
     local sha; sha="$(git rev-parse "$peerref")"
     if git merge-base --is-ancestor "$sha" "$head" 2>/dev/null; then
-      echo "syncgit: GC $peerref (absorbed into HEAD)"
+      syncgit_log info "GC $peerref (absorbed into HEAD)"
       git update-ref -d "$peerref"
     fi
   done < <(git for-each-ref --format='%(refname)' "refs/pr/")
@@ -401,18 +760,42 @@ PY
   while IFS= read -r ttlref; do
     local ts
     ts="$(echo "$ttlref" | awk -F/ '{print $NF}')"
+    # Only TTL-drop refs that conform to refs/pr/<id>/<ts>; preserve malformed
+    # refs (likely manual or buggy) so an operator can investigate them.
+    if [[ ! "$ttlref" =~ ^refs/pr/[A-Za-z0-9_-]+/[0-9]{8}T[0-9]{6}Z(-[a-z0-9]{6})?$ ]]; then
+      continue
+    fi
     if [[ "$ts" < "$cutoff" ]]; then
-      echo "syncgit: TTL drop $ttlref"
+      syncgit_log info "TTL drop $ttlref"
       git update-ref -d "$ttlref"
     fi
   done < <(git for-each-ref --format='%(refname)' "refs/pr/")
 }
 
 cmd_gc() {
+  case "${1:-}" in -h|--help)
+    syncgit_subhelp gc "garbage-collect absorbed and TTL-expired PR refs" \
+"Usage: syncgit gc
+
+Three passes:
+  1. Drop own outbound refs absorbed by every peer's branch.
+  2. Drop inbound refs already merged into HEAD.
+  3. Drop any refs/pr/* older than SYNCGIT_TTL_DAYS (default 14).
+
+Called automatically by 'syncgit push'."
+  ;; esac
   syncgit_gc
 }
 
 cmd_push() {
+  case "${1:-}" in -h|--help)
+    syncgit_subhelp push "broadcast HEAD to peers as refs/pr/<id>/<ts> and GC" \
+"Usage: syncgit push
+
+Pushes HEAD to every peer as refs/pr/<self>/<ts>, records the ref locally,
+clears pre-merge snapshot, then runs GC. Exits 1 if any peer push fails
+(no local ref recorded; retry is safe)."
+  ;; esac
   syncgit_lock
   local self ts head
   self="$(syncgit_self_id)"
@@ -421,14 +804,24 @@ cmd_push() {
   local ref="refs/pr/$self/$ts"
 
   # broadcast
+  local all_ok=1
+  local failed_peers=()
   while IFS=$'\t' read -r id _; do
-    echo "syncgit: pushing $ref to peer-$id"
+    syncgit_log info "pushing $ref to peer-$id"
     if ! git push -q "peer-$id" "HEAD:$ref"; then
-      echo "syncgit: push to peer-$id failed" >&2
+      echo "syncgit: push: push to peer-$id failed" >&2
+      all_ok=0
+      failed_peers+=("$id")
     fi
   done < <(syncgit_peers)
 
-  # also save the just-pushed ref locally so GC can track it
+  if [[ "$all_ok" == 0 ]]; then
+    echo "syncgit: push: broadcast incomplete — failed peers: ${failed_peers[*]}" >&2
+    echo "  Local outbound ref NOT recorded; GC will not run; broadcast can be retried." >&2
+    exit 1
+  fi
+
+  # All-good path: save the just-pushed ref locally so GC can track it
   git update-ref "$ref" "$head"
 
   # clean up pre-merge snapshot if present
@@ -440,9 +833,17 @@ cmd_push() {
 }
 
 cmd_show() {
+  case "${1:-}" in -h|--help)
+    syncgit_subhelp show "log + diffstat of <ref> relative to HEAD" \
+"Usage: syncgit show <ref>
+
+  <ref>   a refs/pr/<id>/<ts> ref or any git ref
+
+Prints commit log and diffstat for <ref> relative to HEAD."
+  ;; esac
   local ref="${1:-}"
   if [[ -z "$ref" ]]; then
-    echo "show: ref required" >&2
+    echo "syncgit: show: ref required" >&2
     exit 1
   fi
   echo "# Log of $ref relative to HEAD:"
@@ -453,6 +854,13 @@ cmd_show() {
 }
 
 cmd_abort() {
+  case "${1:-}" in -h|--help)
+    syncgit_subhelp abort "roll back to pre-merge or pre-squash snapshot" \
+"Usage: syncgit abort
+
+Rolls HEAD back to the snapshot saved by 'syncgit merge' or 'syncgit squash'.
+Also aborts any in-progress rebase. Exits 0 if no snapshot exists."
+  ;; esac
   local snap_ref=""
   local branch_file=""
   local top
@@ -494,6 +902,14 @@ cmd_abort() {
 }
 
 cmd_squash() {
+  case "${1:-}" in -h|--help)
+    syncgit_subhelp squash "collapse self-authored commits since last push into one" \
+"Usage: syncgit squash
+
+Squashes all self-authored commits since the last outbound ref (refs/pr/<self>/*)
+into a single commit. Requires a clean working tree and no peer/merge commits in range.
+Use 'syncgit abort' to roll back."
+  ;; esac
   syncgit_lock
   local self top current_branch
   self="$(syncgit_self_id)"
@@ -503,7 +919,7 @@ cmd_squash() {
   local current_name
   current_name="$(git config user.name 2>/dev/null || echo "")"
   if [[ "$current_name" != "$self" ]]; then
-    echo "syncgit: this worktree's git user.name (\"$current_name\") is not \"$self\"" >&2
+    echo "syncgit: squash: this worktree's git user.name (\"$current_name\") is not \"$self\"" >&2
     echo "  squash needs author-based filtering. Either:" >&2
     echo "    - run: git config --worktree user.name \"$self\"" >&2
     echo "    - or re-run 'syncgit init' to set it automatically" >&2
@@ -532,7 +948,7 @@ cmd_squash() {
 
   # Refuse dirty working tree
   if ! git diff --quiet || ! git diff --cached --quiet; then
-    echo "syncgit: working tree is dirty; commit or stash first" >&2
+    echo "syncgit: squash: working tree is dirty; commit or stash first" >&2
     exit 1
   fi
 
@@ -542,7 +958,7 @@ cmd_squash() {
   mixed=$(( total_n - n ))
   merges="$(git rev-list --merges "$since..HEAD" --count)"
   if [[ "$mixed" -gt 0 || "$merges" -gt 0 ]]; then
-    echo "syncgit: $since..HEAD contains peer or merge commits" >&2
+    echo "syncgit: squash: $since..HEAD contains peer or merge commits" >&2
     echo "  squash only handles ranges of pure self-authored linear commits." >&2
     echo "  Run 'syncgit push' first to broadcast, then squash on a fresh range." >&2
     exit 1
@@ -575,7 +991,36 @@ $(git log --reverse --format='- %s' "$since..HEAD" --author="^$self <")"
   echo "syncgit: squashed $n commits into $(git rev-parse --short HEAD)"
 }
 
+cmd_unlock() {
+  case "${1:-}" in -h|--help)
+    syncgit_subhelp unlock "remove a stale .syncgit/lock directory" \
+"Usage: syncgit unlock
+
+Removes <worktree>/.syncgit/lock if it exists (left behind by a crashed agent).
+Always exits 0. If no lock is held, prints 'no lock held'."
+  ;; esac
+  local top lockdir
+  top="$(git rev-parse --show-toplevel)"
+  lockdir="$top/.syncgit/lock"
+  if [[ -d "$lockdir" ]]; then
+    rm -rf "$lockdir"
+    echo "syncgit: removed stale lock at $lockdir"
+  else
+    echo "syncgit: no lock held"
+  fi
+}
+
 main() {
+  SYNCGIT_VERBOSITY="${SYNCGIT_VERBOSITY:-normal}"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -q|--quiet)   SYNCGIT_VERBOSITY=quiet;   shift ;;
+      -v|--verbose) SYNCGIT_VERBOSITY=verbose; shift ;;
+      *) break ;;
+    esac
+  done
+  export SYNCGIT_VERBOSITY
+
   local cmd="${1:-}"; shift || true
   case "$cmd" in
     init)   cmd_init "$@" ;;
@@ -590,8 +1035,10 @@ main() {
     show)   cmd_show "$@" ;;
     abort)  cmd_abort "$@" ;;
     squash) cmd_squash "$@" ;;
+    unlock) cmd_unlock "$@" ;;
     ""|-h|--help|help) usage ;;
-    *) echo "syncgit: unknown command $cmd" >&2; usage; exit 1 ;;
+    --version|-V) echo "syncgit $version"; exit 0 ;;
+    *) echo "syncgit: unknown command '$cmd'" >&2; usage; exit 1 ;;
   esac
 }
 

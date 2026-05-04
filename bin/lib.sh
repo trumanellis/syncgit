@@ -3,6 +3,29 @@
 
 set -euo pipefail
 
+# Validate a peer id against the canonical pattern.
+# Usage: syncgit_validate_id <id> <context>
+# Prints error and exits 1 on failure; silent on success.
+syncgit_validate_id() {
+  local id="$1"
+  local ctx="${2:-init}"
+  if [[ ! "$id" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]]; then
+    echo "syncgit: $ctx: invalid peer id '$id' (must be 1-64 chars, alphanumeric + - + _, not starting with - or _)" >&2
+    exit 1
+  fi
+}
+
+# Logging helper. Levels: error (always stderr), info (normal+verbose stdout),
+# debug (verbose-only stderr).
+syncgit_log() {
+  local level="$1"; shift
+  case "$level" in
+    error) echo "syncgit: $*" >&2 ;;
+    info)  [[ "${SYNCGIT_VERBOSITY:-normal}" != "quiet" ]] && echo "syncgit: $*" ;;
+    debug) [[ "${SYNCGIT_VERBOSITY:-normal}" == "verbose" ]] && echo "syncgit: [debug] $*" >&2 ;;
+  esac
+}
+
 # Find the syncgit root: the directory containing .syncgit/peers.json, walking
 # up from CWD. For a worktree, this is the parent dir of the worktrees.
 syncgit_root() {
@@ -17,6 +40,25 @@ syncgit_root() {
   done
   echo "syncgit: no .syncgit/peers.json found in any parent" >&2
   return 1
+}
+
+# Find the true parent root — the directory that *contains* the peer worktrees
+# and holds the primary .git directory. Uses git's common-dir (the shared object
+# store that all worktrees point back to) to locate it reliably.
+#
+# For a worktree at <root>/<id>, git-common-dir resolves to <root>/.git, so
+# dirname of that gives <root>. For the main worktree (called from <root>
+# directly), git-common-dir is just ".git" relative to <root>, same result.
+syncgit_parent_root() {
+  local common_dir abs_common
+  common_dir="$(git rev-parse --git-common-dir)"
+  # Make absolute (may be relative like ".git" or "../.git")
+  if [[ "$common_dir" = /* ]]; then
+    abs_common="$common_dir"
+  else
+    abs_common="$(cd "$(git rev-parse --show-toplevel)" && cd "$common_dir" && pwd)"
+  fi
+  dirname "$abs_common"
 }
 
 # Current worktree id. Reads <worktree-toplevel>/.syncgit/self if present
@@ -64,7 +106,14 @@ for p in peers:
 PY
 }
 
-syncgit_ts() { date -u +%Y%m%dT%H%M%SZ; }
+syncgit_ts() {
+  # Append a 6-char random suffix so two pushes in the same UTC second don't collide.
+  # Shape: YYYYMMDDTHHMMSSZ-XXXXXX  (still lexicographically sortable by time prefix).
+  local stamp suffix
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  suffix="$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | head -c 6 || echo "$$$$$$" | head -c 6)"
+  printf '%s-%s\n' "$stamp" "$suffix"
+}
 
 syncgit_halt() {
   local root msg="$1"

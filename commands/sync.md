@@ -1,8 +1,8 @@
 ---
-description: SynGit — stage judiciously, commit, absorb peer PRs, verify, broadcast.
+description: syncgit — stage judiciously, commit, absorb peer PRs, verify, broadcast.
 ---
 
-You are the agent for this worktree. Run SynGit end-to-end. The CLI is
+You are the agent for this worktree. Run syncgit end-to-end. The CLI is
 `~/.claude/scripts/syncgit/syncgit` (add it to PATH if convenient, or call
 directly). Do not skip steps. If any step fails in a way not covered below,
 stop and report — do not improvise around the protocol.

@@ -6,14 +6,15 @@ This repo uses **syncgit** — a peer-to-peer VCS where each git worktree is an 
 
 1. `syncgit stage` — review the diff and `git add` only real work. Never stage logs, `node_modules`, `dist`, `.env*`, or anything listed in `.syncgit/ignore`.
 2. Commit with a short imperative message scoped to this slice.
-3. `syncgit merge` — rebase through every pending peer PR, oldest first.
-4. On conflict: resolve in-file, `git rebase --continue`, re-run `syncgit merge`. After 3 failed attempts, abort and halt with a summary in `.syncgit/last-halt.md` rather than guessing.
-5. `syncgit verify` — must pass before broadcast if `.syncgit/verify.sh` exists.
-6. `syncgit push` — broadcasts `HEAD` to every peer.
+2.5. *(Optional)* `syncgit squash` — collapse many small commits into one before broadcasting. Skip if peer PRs are pending in the range (push first, then squash next round).
+3. `syncgit merge` — absorb every pending peer PR, oldest first. Preview individual refs first with `syncgit show <ref>` and `syncgit status`.
+4. On conflict: resolve in-file, `git rebase --continue`, re-run `syncgit merge`. After 3 failed attempts, run `syncgit abort` to roll back to the pre-merge snapshot, then halt with a summary in `.syncgit/last-halt.md` rather than guessing.
+5. `syncgit verify` — must pass before broadcast if `.syncgit/verify.sh` exists. On repeated failure, run `syncgit abort` to roll back.
+6. `syncgit push` — broadcasts `HEAD` to every peer and GCs absorbed refs.
 
 **Rules:**
 - Always merge inbound peer PRs *before* broadcasting your own.
-- Rebase, never merge-commit — history stays linear across peers.
-- If you can't make the tree clean, **halt** and write `.syncgit/last-halt.md`. Do not force-push, do not `--no-verify`, do not skip `syncgit verify`.
+- Use `syncgit abort` to roll back to the pre-merge snapshot on unresolvable conflicts or verify failures — do not force-push or skip steps.
+- If you can't make the tree clean after 3 attempts, **halt** and write `.syncgit/last-halt.md`. Do not `--no-verify`, do not skip `syncgit verify`.
 - Check peer state with `syncgit status` before starting non-trivial work so you don't duplicate a sibling's effort.
 - Your peer identity is the worktree directory name; treat sibling worktrees as independent collaborators, not as backups.

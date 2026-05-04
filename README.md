@@ -103,23 +103,37 @@ If a rebase can't resolve cleanly after 3 tries, the agent halts and writes `.sy
 | Command | Purpose |
 |---------|---------|
 | `syncgit init --peers a,b,c` | Create parent repo and N worktrees, wire remotes |
+| `syncgit peers list\|add\|remove` | Manage peer set (add/remove work live) |
 | `syncgit status` | Show inbound/outbound PR queue |
 | `syncgit fetch` | Fetch refs/pr/* from every peer (seam for network transport) |
 | `syncgit stage` | Show categorized diff for agent review |
-| `syncgit merge` | Rebase through pending peer PRs |
+| `syncgit merge` | Absorb pending peer PRs |
 | `syncgit verify` | Run .syncgit/verify.sh if present |
 | `syncgit push` | Broadcast HEAD to peers and run GC |
 | `syncgit gc` | Garbage-collect absorbed and TTL-expired PR refs |
-| `syncgit show <ref>` | Show log and diffstat of `<ref>` relative to HEAD (for previewing peer PRs) |
-| `syncgit abort` | Roll back to pre-merge snapshot |
+| `syncgit show <ref>` | Show log and diffstat of `<ref>` relative to HEAD |
+| `syncgit abort` | Roll back to pre-merge or pre-squash snapshot |
 | `syncgit squash` | Collapse self-authored commits since last push into one |
+| `syncgit unlock` | Remove a stale `.syncgit/lock` left by a crashed agent |
+
+Global flags: `-q`/`--quiet`, `-v`/`--verbose`, `--version`/`-V`, `-h`/`--help`. Every subcommand also accepts `-h`/`--help`.
+
+## Requirements
+
+- Bash ≥ 3.2 (macOS default works)
+- Git ≥ 2.23
+- Python 3 ≥ 3.6 (date math and JSON parsing)
+- macOS or Linux (Windows likely works under Git Bash; untested)
 
 ## Configuration
 
-Environment variables control merge strategy and PR retention:
+Environment variables:
 
-- `SYNCGIT_MERGE_STRATEGY` — `merge` (default) or `rebase`. The `merge` strategy builds a peer-chain using merge commits, preserving every peer's commit SHA verbatim. The `rebase` strategy is the legacy linear loop: only the last peer's SHA survives intact, but history stays strictly linear.
-- `SYNCGIT_TTL_DAYS` — Integer, default 14. Refs older than this are dropped during `gc` / `push`. Refs older than the TTL are treated as stale peer PRs and safely removed.
+| Variable | Default | Description |
+|---|---|---|
+| `SYNCGIT_MERGE_STRATEGY` | `merge` | `merge` preserves all peer SHAs via merge-commit chain. `rebase` gives strictly linear history; only the last peer's SHA survives. See `docs/architecture.md`. |
+| `SYNCGIT_TTL_DAYS` | `14` | Refs older than this (days) are dropped during `gc` / `push`. |
+| `SYNCGIT_VERBOSITY` | `normal` | `quiet` / `normal` / `verbose`. Equivalent to the `-q` / `-v` global flags. |
 
 ## How merging works
 
@@ -130,6 +144,58 @@ When you run `syncgit merge`, it absorbs every pending peer PR in chronological 
 `syncgit squash` collapses all of your commits made since your last `syncgit push` into a single commit. It only touches commits you authored — peer commits and merge commits in the same range cause it to refuse with a clear message (push first to broadcast, then squash on the next round).
 
 To identify which commits are "yours", `syncgit init` sets a per-worktree git identity (`git config user.name <peer-id>`) on each worktree it creates. This is a local, worktree-scoped config — it does not touch your global `~/.gitconfig`. If you ever need to re-initialize the identity (e.g. on a worktree created before this feature), run `git config user.name <your-peer-id>` inside the worktree, or re-run `syncgit init` to have it applied automatically.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Success |
+| `1` | User error or partial broadcast (see stderr) |
+| `2` | Halted — see `.syncgit/last-halt.md` for details |
+| `3` | Merge or rebase conflict — see the error message for the resolution path |
+
+## Troubleshooting
+
+**Lock stuck after a crash.** Run `syncgit unlock` from inside the worktree. The lock is a directory at `.syncgit/lock`; unlock removes it unconditionally.
+
+**"previous merge in progress".** A previous `syncgit merge` left a snapshot (`refs/syncgit/pre-merge`). Either run `syncgit push` to broadcast the merged state, or `syncgit abort` to roll back to the pre-merge state.
+
+**Chain-merge conflict.** When two peer branches edit the same lines, the default `merge` strategy auto-rolls-back to your original branch and prints recovery instructions. Retry with `SYNCGIT_MERGE_STRATEGY=rebase syncgit merge` to surface per-peer conflicts one at a time. Resolve each with `git add <files> && git rebase --continue`. `syncgit abort` is available to roll back at any point.
+
+**"squash refuses with mixed range".** The commit range contains peer commits or merge commits. Run `syncgit push` first to broadcast, then squash on the next round when the range is clean self-authored commits only.
+
+**Disjoint history error.** A peer was bootstrapped from a different seed commit and shares no common ancestor with HEAD. Inspect the offending peer ref with `syncgit show <ref>` and remove it manually if it is not legitimate.
+
+## Testing and CI
+
+Run the test suite locally:
+
+```sh
+bash tests/run.sh
+```
+
+The suite runs 9 black-box scenarios covering init, peers, merge strategies, GC, abort, squash, and unlock.
+
+CI runs on every push and pull request via GitHub Actions:
+- Matrix: `ubuntu-latest` and `macos-latest`
+- shellcheck lints all shell scripts
+- Full test suite runs on both platforms
+
+## OS coverage
+
+| OS | Status |
+|---|---|
+| macOS 14+ | tested |
+| Ubuntu 22.04+ | tested via CI |
+| Windows | untested (Git Bash should work) |
+
+## Documentation
+
+- [`docs/architecture.md`](docs/architecture.md) — peer SHA preservation, merge-commit chain design
+- [`docs/security.md`](docs/security.md) — trust model, attack surface, verify.sh guidance
+- [`CHANGELOG.md`](CHANGELOG.md) — release history
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — development setup, commit style, releasing
+- [`examples/`](examples/) — sample `.syncgit/verify.sh` and `.syncgit/ignore`
 
 ## Not married to Claude Code
 

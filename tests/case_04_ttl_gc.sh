@@ -40,14 +40,8 @@ assert_success "as_peer '$tmpdir' a git rev-parse --verify --quiet refs/pr/a/202
 
 # Step 3: Run syncgit gc with TTL=1 day (so 2020 ref is definitely old)
 echo "  [a] running syncgit gc with SYNCGIT_TTL_DAYS=1..."
-if as_peer "$tmpdir" a bash -c "SYNCGIT_TTL_DAYS=1 $SYNCGIT gc"; then
-  echo "  syncgit gc completed"
-else
-  # If gc doesn't exist yet, this is expected
-  echo "  (note: syncgit gc not implemented yet; test incomplete)"
-  echo "  Requires: syncgit gc subcommand (Phase 2b/2c)"
-  exit 0
-fi
+as_peer "$tmpdir" a bash -c "SYNCGIT_TTL_DAYS=1 $SYNCGIT gc"
+echo "  syncgit gc completed"
 
 # Step 4: Assert old ref is gone
 echo "  Verifying old ref was deleted..."

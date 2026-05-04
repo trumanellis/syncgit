@@ -71,17 +71,7 @@ echo "  Verifying GC cleaned up PR refs..."
 a_pr_refs="$(as_peer "$tmpdir" a git for-each-ref refs/pr/ --format='%(refname)' | grep -v "refs/pr/a/" || true)"
 b_pr_refs="$(as_peer "$tmpdir" b git for-each-ref refs/pr/ --format='%(refname)' | grep -v "refs/pr/b/" || true)"
 
-if [[ -z "$a_pr_refs" ]]; then
-  pass "no foreign PR refs in a after convergence"
-else
-  # Lenient: some refs may linger if not yet GC'd, but none from other peers should remain
-  echo "  (note: some refs may linger; checking that only self-refs remain)"
-fi
-
-if [[ -z "$b_pr_refs" ]]; then
-  pass "no foreign PR refs in b after convergence"
-else
-  echo "  (note: some refs may linger; checking that only self-refs remain)"
-fi
+assert_eq "" "$a_pr_refs" "no foreign PR refs in a after convergence"
+assert_eq "" "$b_pr_refs" "no foreign PR refs in b after convergence"
 
 echo "  Sequential test passed"
