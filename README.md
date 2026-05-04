@@ -98,6 +98,39 @@ Each worktree adds every sibling as a local git remote. The "PR queue" between p
 
 If a rebase can't resolve cleanly after 3 tries, the agent halts and writes `.syncgit/last-halt.md` rather than guessing.
 
+## Subcommands
+
+| Command | Purpose |
+|---------|---------|
+| `syncgit init --peers a,b,c` | Create parent repo and N worktrees, wire remotes |
+| `syncgit status` | Show inbound/outbound PR queue |
+| `syncgit fetch` | Fetch refs/pr/* from every peer (seam for network transport) |
+| `syncgit stage` | Show categorized diff for agent review |
+| `syncgit merge` | Rebase through pending peer PRs |
+| `syncgit verify` | Run .syncgit/verify.sh if present |
+| `syncgit push` | Broadcast HEAD to peers and run GC |
+| `syncgit gc` | Garbage-collect absorbed and TTL-expired PR refs |
+| `syncgit show <ref>` | Show log and diffstat of `<ref>` relative to HEAD (for previewing peer PRs) |
+| `syncgit abort` | Roll back to pre-merge snapshot |
+| `syncgit squash` | Collapse self-authored commits since last push into one |
+
+## Configuration
+
+Environment variables control merge strategy and PR retention:
+
+- `SYNCGIT_MERGE_STRATEGY` — `merge` (default) or `rebase`. The `merge` strategy builds a peer-chain using merge commits, preserving every peer's commit SHA verbatim. The `rebase` strategy is the legacy linear loop: only the last peer's SHA survives intact, but history stays strictly linear.
+- `SYNCGIT_TTL_DAYS` — Integer, default 14. Refs older than this are dropped during `gc` / `push`. Refs older than the TTL are treated as stale peer PRs and safely removed.
+
+## How merging works
+
+When you run `syncgit merge`, it absorbs every pending peer PR in chronological order. By default (merge strategy), it chains the peer refs together with merge commits, so every peer's original commit SHA remains reachable in your history—critical for GC to detect absorption. If you prefer strict linear history, set `SYNCGIT_MERGE_STRATEGY=rebase` to get the legacy behavior, though only the last peer's SHA survives the rebase intact.
+
+## Squashing your own commits
+
+`syncgit squash` collapses all of your commits made since your last `syncgit push` into a single commit. It only touches commits you authored — peer commits and merge commits in the same range cause it to refuse with a clear message (push first to broadcast, then squash on the next round).
+
+To identify which commits are "yours", `syncgit init` sets a per-worktree git identity (`git config user.name <peer-id>`) on each worktree it creates. This is a local, worktree-scoped config — it does not touch your global `~/.gitconfig`. If you ever need to re-initialize the identity (e.g. on a worktree created before this feature), run `git config user.name <your-peer-id>` inside the worktree, or re-run `syncgit init` to have it applied automatically.
+
 ## Not married to Claude Code
 
 `/sync` is the Claude Code frontend, but syncgit itself is a CLI plus a git ref convention — any agent or human can drive the same loop. See [`bin/syncgit`](bin/syncgit) for the underlying commands.

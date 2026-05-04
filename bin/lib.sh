@@ -19,9 +19,31 @@ syncgit_root() {
   return 1
 }
 
-# Current worktree id = basename of the git worktree dir.
+# Current worktree id. Reads <worktree-toplevel>/.syncgit/self if present
+# (written by cmd_init); otherwise falls back to basename of the toplevel dir.
 syncgit_self_id() {
-  basename "$(git rev-parse --show-toplevel)"
+  local top
+  top="$(git rev-parse --show-toplevel)"
+  if [[ -f "$top/.syncgit/self" ]]; then
+    cat "$top/.syncgit/self"
+  else
+    basename "$top"
+  fi
+}
+
+# Advisory lock using mkdir as atomic primitive (portable, no flock needed).
+# On success installs an EXIT trap to remove the lock dir.
+# On failure prints an error and exits 1.
+syncgit_lock() {
+  local top lockdir
+  top="$(git rev-parse --show-toplevel)"
+  lockdir="$top/.syncgit/lock"
+  if ! mkdir "$lockdir" 2>/dev/null; then
+    echo "syncgit: another agent is running here (lock held at $lockdir)" >&2
+    exit 1
+  fi
+  # shellcheck disable=SC2064
+  trap "rm -rf '$lockdir'" EXIT INT TERM HUP
 }
 
 # Iterate peers from peers.json as "id<TAB>path" lines, excluding self.

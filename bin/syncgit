@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # syncgit — peer-worktree VCS over git refs
 #
-# Subcommands: init, peers, status, fetch, stage, merge, verify, push
+# Subcommands: init, peers, status, fetch, stage, merge, verify, push, gc,
+#              show, abort, squash
 #
 # Layout: a parent dir contains one shared git repo plus N worktree dirs, one
 # per peer. .syncgit/peers.json at the parent lists the peers. Each worktree
@@ -26,6 +27,10 @@ syncgit <command> [args]
   merge                    rebase through pending peer PRs
   verify                   run .syncgit/verify.sh if present
   push                     broadcast HEAD to peers as refs/pr/<id>/<ts> and GC
+  gc                       garbage-collect absorbed and TTL-expired PR refs
+  show <ref>               log + diffstat of <ref> relative to HEAD
+  abort                    roll back to pre-merge snapshot
+  squash                   collapse self-authored commits since last push into one
 EOF
 }
 
@@ -56,6 +61,8 @@ cmd_init() {
     # seed commit so worktrees have a base
     (cd "$root" && git commit --allow-empty -q -m "syncgit: init")
   fi
+  # Enable per-worktree config so each worktree can have its own user.name
+  (cd "$root" && git config extensions.worktreeConfig true)
   # clear any stale worktree registrations (dirs that were deleted by hand)
   (cd "$root" && git worktree prune)
 
@@ -83,10 +90,14 @@ PY
       (cd "$root" && git worktree add -q "$id" -b "$id")
     fi
   done
-  # copy peers.json + wire remotes inside each worktree
+  # copy peers.json + write self file + wire remotes inside each worktree
   for id in "${ids[@]}"; do
     mkdir -p "$root/$id/.syncgit"
     cp "$root/.syncgit/peers.json" "$root/$id/.syncgit/peers.json"
+    printf '%s' "$id" > "$root/$id/.syncgit/self"
+    # Pin per-worktree git identity so cmd_squash can filter by author.
+    # Requires extensions.worktreeConfig (enabled above) for true isolation.
+    (cd "$root/$id" && git config --worktree user.name "$id" && git config --worktree user.email "$id@syncgit.local")
     for peer in "${ids[@]}"; do
       [[ "$peer" == "$id" ]] && continue
       (cd "$root/$id" && git remote remove "peer-$peer" 2>/dev/null || true)
@@ -110,19 +121,24 @@ cmd_peers() {
 }
 
 cmd_fetch() {
-  # Worktrees share the ref database, so pushes from peers are already
-  # visible under refs/pr/*. Fetch is a no-op in local mode; kept as a
-  # command for future network transport.
+  # Future network-transport seam. Currently a no-op because all worktrees
+  # share the same ref database — a `git push peer-x HEAD:refs/pr/...` already
+  # makes the ref visible in every worktree without any explicit fetch step.
+  # When network transport is added (e.g., peers on different machines), this
+  # is where `git fetch peer-*` calls would live so that inbound
+  # refs/pr/<peer>/<ts> refs are pulled down before merge/status inspect them.
   :
 }
 
 # List pending PR refs (refs/pr/<peer>/<ts>) not yet ancestor of HEAD,
 # oldest first. Output: "sha<TAB>refname".
+# Sorted by the <ts> suffix (4th /-delimited segment of the refname) so that
+# lexicographic order matches chronological order regardless of committer clock.
 syncgit_pending() {
   local head self
   head="$(git rev-parse HEAD)"
   self="$(syncgit_self_id)"
-  git for-each-ref --sort=committerdate \
+  git for-each-ref \
     --format='%(objectname)%09%(refname)' 'refs/pr/' \
   | while IFS=$'\t' read -r sha ref; do
       # ref is refs/pr/<id>/<ts>; skip our own
@@ -132,7 +148,14 @@ syncgit_pending() {
       if ! git merge-base --is-ancestor "$sha" "$head" 2>/dev/null; then
         printf '%s\t%s\n' "$sha" "$ref"
       fi
-    done
+    done \
+  | awk -F'\t' '{
+      n = split($2, parts, "/")
+      ts = parts[n]
+      print ts "\t" $1 "\t" $2
+    }' \
+  | sort \
+  | awk -F'\t' '{print $2 "\t" $3}'
 }
 
 cmd_status() {
@@ -170,6 +193,7 @@ cmd_stage() {
 }
 
 cmd_merge() {
+  syncgit_lock
   cmd_fetch
   local pending
   pending="$(syncgit_pending || true)"
@@ -177,6 +201,32 @@ cmd_merge() {
     echo "syncgit: no pending peer PRs"
     return 0
   fi
+  # Refuse to clobber an existing snapshot — a previous merge is in flight.
+  if git rev-parse --verify --quiet refs/syncgit/pre-merge >/dev/null 2>&1; then
+    echo "syncgit: previous merge in progress (snapshot at refs/syncgit/pre-merge)" >&2
+    echo "  Either:" >&2
+    echo "    - resolve and run 'syncgit push', or" >&2
+    echo "    - run 'syncgit abort' to roll back to the snapshot" >&2
+    exit 1
+  fi
+  # Snapshot HEAD so cmd_abort can roll back if needed
+  git update-ref refs/syncgit/pre-merge HEAD
+  git rev-parse --abbrev-ref HEAD > "$(git rev-parse --show-toplevel)/.syncgit/pre-merge-branch"
+
+  local strategy="${SYNCGIT_MERGE_STRATEGY:-merge}"
+  case "$strategy" in
+    merge)  syncgit_merge_via_chain "$pending" ;;
+    rebase) syncgit_merge_via_rebase "$pending" ;;
+    *) echo "syncgit: unknown SYNCGIT_MERGE_STRATEGY=$strategy" >&2; exit 1 ;;
+  esac
+}
+
+# Legacy strategy: rebase HEAD onto each pending peer ref in turn.
+# Side effect: only the LAST peer's commit SHA survives verbatim; earlier peers'
+# commits are replayed onto subsequent peer tips and get new SHAs. Kept for users
+# who want strict linear history and accept the SHA-rewrite cost.
+syncgit_merge_via_rebase() {
+  local pending="$1"
   while IFS=$'\t' read -r sha ref; do
     echo "syncgit: rebasing onto $ref ($sha)"
     if ! git rebase "$sha"; then
@@ -184,13 +234,112 @@ cmd_merge() {
       echo "  Files in conflict:"
       git diff --name-only --diff-filter=U | sed 's/^/    /'
       echo "  Resolve, then run: git add <files> && git rebase --continue"
-      echo "  Or abort: git rebase --abort"
+      echo "  Or abort: syncgit abort"
       exit 3
     fi
   done <<< "$pending"
 }
 
+# Default strategy: build a peer-chain (linear if pending refs are already
+# linearly ordered, otherwise a sequence of merge commits) and rebase local
+# commits onto its tip. Every peer's original SHA is reachable in the result
+# (either directly on the chain or as a merge parent), which is what cmd_push's
+# GC requires to detect that a peer's broadcast was absorbed.
+syncgit_merge_via_chain() {
+  local pending="$1"
+
+  local orig_branch
+  orig_branch="$(git rev-parse --abbrev-ref HEAD)"
+  local local_tip
+  local_tip="$(git rev-parse HEAD)"
+
+  # Collect peer shas + refs into parallel arrays (oldest-first per syncgit_pending).
+  local -a peer_shas=()
+  local -a peer_refs=()
+  while IFS=$'\t' read -r sha ref; do
+    peer_shas+=("$sha")
+    peer_refs+=("$ref")
+  done <<< "$pending"
+
+  # Compute local_base: common ancestor of HEAD and every peer ref. Try octopus
+  # first; fall back to pairwise reduction if octopus refuses.
+  local local_base
+  if ! local_base="$(git merge-base --octopus "$local_tip" "${peer_shas[@]}" 2>/dev/null)"; then
+    local_base="$local_tip"
+    local s
+    for s in "${peer_shas[@]}"; do
+      local_base="$(git merge-base "$local_base" "$s")"
+    done
+  fi
+
+  # Detect linearity: each peer's sha must be ancestor of the next peer's sha.
+  local linear=1
+  local prev_sha=""
+  local s
+  for s in "${peer_shas[@]}"; do
+    if [[ -n "$prev_sha" ]]; then
+      if ! git merge-base --is-ancestor "$prev_sha" "$s" 2>/dev/null; then
+        linear=0; break
+      fi
+    fi
+    prev_sha="$s"
+  done
+
+  local chain_tip_sha
+  if [[ "$linear" == 1 ]]; then
+    # Linear case (also covers single-peer): chain tip is the last pending sha.
+    chain_tip_sha="${peer_shas[${#peer_shas[@]}-1]}"
+  else
+    # Build merge-chain on a detached HEAD starting at the first peer ref.
+    git checkout --quiet --detach "${peer_shas[0]}"
+    local i
+    for (( i=1; i<${#peer_shas[@]}; i++ )); do
+      local next_ref="${peer_refs[$i]}"
+      local next_sha="${peer_shas[$i]}"
+      echo "syncgit: chain-merging $next_ref ($next_sha)"
+      if ! git merge --no-ff --no-edit -m "syncgit: absorb $next_ref" "$next_sha"; then
+        # Atomic rollback: chain-merge can't auto-resolve mid-chain conflicts,
+        # so unwind the partial chain entirely and tell the user to retry with
+        # the legacy linear strategy (per-peer rebase conflicts can be resolved
+        # one at a time with the standard git rebase --continue flow).
+        git merge --abort 2>/dev/null || true
+        git checkout -q "$orig_branch"
+        git update-ref -d refs/syncgit/pre-merge 2>/dev/null || true
+        rm -f "$(git rev-parse --show-toplevel)/.syncgit/pre-merge-branch" 2>/dev/null || true
+        echo "syncgit: chain-merge conflict while absorbing $next_ref" >&2
+        echo "  Rolled back to $orig_branch. The merge-commit chain strategy can't auto-resolve this." >&2
+        echo "  Retry with the legacy linear strategy:" >&2
+        echo "      SYNCGIT_MERGE_STRATEGY=rebase syncgit merge" >&2
+        echo "  That gives per-peer rebase conflicts you can resolve with the standard" >&2
+        echo "  'git add <files> && git rebase --continue' flow, with \`syncgit abort\` available" >&2
+        echo "  to roll back at any point." >&2
+        exit 3
+      fi
+    done
+    chain_tip_sha="$(git rev-parse HEAD)"
+    # Return to the original branch before replaying local commits.
+    git checkout --quiet "$orig_branch"
+  fi
+
+  # Replay local commits (local_base..local_tip) onto the chain tip. If the
+  # branch has nothing past local_base, just fast-forward to chain_tip_sha.
+  if [[ "$local_base" == "$local_tip" ]]; then
+    git reset --hard --quiet "$chain_tip_sha"
+  else
+    echo "syncgit: rebasing local commits onto chain tip $chain_tip_sha"
+    if ! git rebase --onto "$chain_tip_sha" "$local_base" "$orig_branch"; then
+      echo "syncgit: conflicts during rebase onto chain tip" >&2
+      echo "  Files in conflict:"
+      git diff --name-only --diff-filter=U | sed 's/^/    /'
+      echo "  Resolve, then run: git add <files> && git rebase --continue"
+      echo "  Or abort: syncgit abort"
+      exit 3
+    fi
+  fi
+}
+
 cmd_verify() {
+  syncgit_lock
   local top
   top="$(git rev-parse --show-toplevel)"
   if [[ -x "$top/.syncgit/verify.sh" ]]; then
@@ -200,7 +349,71 @@ cmd_verify() {
   fi
 }
 
+# GC helper — three passes:
+#   1. Our own outbound refs (refs/pr/<self>/*) absorbed by every peer's branch.
+#   2. Inbound peer refs (refs/pr/<other>/*) already ancestor of HEAD.
+#   3. Any refs/pr/* whose <ts> suffix is older than SYNCGIT_TTL_DAYS (default 14).
+syncgit_gc() {
+  local self
+  self="$(syncgit_self_id)"
+
+  # Pass 1: drop our own refs absorbed by all peers
+  while IFS= read -r localref; do
+    local sha; sha="$(git rev-parse "$localref")"
+    local absorbed=1
+    while IFS=$'\t' read -r id _; do
+      local peer_head
+      peer_head="$(git rev-parse --verify --quiet "refs/heads/$id" 2>/dev/null || echo "")"
+      if [[ -z "$peer_head" ]] || ! git merge-base --is-ancestor "$sha" "$peer_head" 2>/dev/null; then
+        absorbed=0; break
+      fi
+    done < <(syncgit_peers)
+    if [[ "$absorbed" == 1 ]]; then
+      echo "syncgit: GC $localref (absorbed by all peers)"
+      git update-ref -d "$localref"
+    fi
+  done < <(git for-each-ref --format='%(refname)' "refs/pr/$self/")
+
+  # Pass 2: drop inbound peer refs already merged into HEAD
+  local head
+  head="$(git rev-parse HEAD)"
+  while IFS= read -r peerref; do
+    local ref_id
+    ref_id="$(echo "$peerref" | awk -F/ '{print $3}')"
+    [[ "$ref_id" == "$self" ]] && continue
+    local sha; sha="$(git rev-parse "$peerref")"
+    if git merge-base --is-ancestor "$sha" "$head" 2>/dev/null; then
+      echo "syncgit: GC $peerref (absorbed into HEAD)"
+      git update-ref -d "$peerref"
+    fi
+  done < <(git for-each-ref --format='%(refname)' "refs/pr/")
+
+  # Pass 3: TTL-based drop — any refs/pr/* older than SYNCGIT_TTL_DAYS days
+  local cutoff
+  cutoff="$(python3 - "${SYNCGIT_TTL_DAYS:-14}" <<'PY'
+import sys
+from datetime import datetime, timedelta, timezone
+days = int(sys.argv[1])
+cutoff_dt = datetime.now(timezone.utc) - timedelta(days=days)
+print(cutoff_dt.strftime("%Y%m%dT%H%M%SZ"))
+PY
+)"
+  while IFS= read -r ttlref; do
+    local ts
+    ts="$(echo "$ttlref" | awk -F/ '{print $NF}')"
+    if [[ "$ts" < "$cutoff" ]]; then
+      echo "syncgit: TTL drop $ttlref"
+      git update-ref -d "$ttlref"
+    fi
+  done < <(git for-each-ref --format='%(refname)' "refs/pr/")
+}
+
+cmd_gc() {
+  syncgit_gc
+}
+
 cmd_push() {
+  syncgit_lock
   local self ts head
   self="$(syncgit_self_id)"
   ts="$(syncgit_ts)"
@@ -215,25 +428,151 @@ cmd_push() {
     fi
   done < <(syncgit_peers)
 
-  # GC: drop our own outbound refs whose commit is now ancestor of every peer's branch
-  while IFS= read -r localref; do
-    local sha; sha="$(git rev-parse "$localref")"
-    local absorbed=1
-    while IFS=$'\t' read -r id _; do
-      local peer_head
-      peer_head="$(git rev-parse --verify --quiet "refs/heads/$id" || echo "")"
-      if [[ -z "$peer_head" ]] || ! git merge-base --is-ancestor "$sha" "$peer_head"; then
-        absorbed=0; break
-      fi
-    done < <(syncgit_peers)
-    if [[ "$absorbed" == 1 ]]; then
-      echo "syncgit: GC $localref (absorbed by all peers)"
-      git update-ref -d "$localref"
-    fi
-  done < <(git for-each-ref --format='%(refname)' "refs/pr/$self/")
-
   # also save the just-pushed ref locally so GC can track it
   git update-ref "$ref" "$head"
+
+  # clean up pre-merge snapshot if present
+  git update-ref -d refs/syncgit/pre-merge 2>/dev/null || true
+  rm -f "$(git rev-parse --show-toplevel)/.syncgit/pre-merge-branch" 2>/dev/null || true
+
+  # GC
+  syncgit_gc
+}
+
+cmd_show() {
+  local ref="${1:-}"
+  if [[ -z "$ref" ]]; then
+    echo "show: ref required" >&2
+    exit 1
+  fi
+  echo "# Log of $ref relative to HEAD:"
+  git log --oneline "HEAD..$ref"
+  echo
+  echo "# Diffstat:"
+  git diff --stat "HEAD...$ref"
+}
+
+cmd_abort() {
+  local snap_ref=""
+  local branch_file=""
+  local top
+  top="$(git rev-parse --show-toplevel)"
+  if git rev-parse --verify --quiet refs/syncgit/pre-squash >/dev/null 2>&1; then
+    snap_ref=refs/syncgit/pre-squash
+    branch_file="$top/.syncgit/pre-squash-branch"
+  elif git rev-parse --verify --quiet refs/syncgit/pre-merge >/dev/null 2>&1; then
+    snap_ref=refs/syncgit/pre-merge
+    branch_file="$top/.syncgit/pre-merge-branch"
+  else
+    echo "syncgit: no snapshot to roll back to"
+    exit 0
+  fi
+  # Abort any in-progress rebase
+  local rebase_merge rebase_apply
+  rebase_merge="$(git rev-parse --git-path rebase-merge 2>/dev/null || echo "")"
+  rebase_apply="$(git rev-parse --git-path rebase-apply 2>/dev/null || echo "")"
+  if [[ -n "$rebase_merge" && -d "$rebase_merge" ]] || \
+     [[ -n "$rebase_apply" && -d "$rebase_apply" ]]; then
+    git rebase --abort 2>/dev/null || true
+  fi
+  git reset --hard "$snap_ref"
+  # Re-attach the original branch if we somehow ended up detached. The
+  # rebase-conflict path above already re-attaches via `git rebase --abort`;
+  # this is defensive coverage for chain-merge / other detached cases.
+  if [[ -f "$branch_file" ]]; then
+    local saved_branch
+    saved_branch="$(cat "$branch_file")"
+    if [[ -n "$saved_branch" && "$saved_branch" != "HEAD" ]]; then
+      if [[ "$(git symbolic-ref --quiet HEAD || echo DETACHED)" == "DETACHED" ]]; then
+        git symbolic-ref HEAD "refs/heads/$saved_branch"
+      fi
+    fi
+    rm -f "$branch_file"
+  fi
+  git update-ref -d "$snap_ref"
+  echo "syncgit: rolled back to pre-${snap_ref##*/pre-} state"
+}
+
+cmd_squash() {
+  syncgit_lock
+  local self top current_branch
+  self="$(syncgit_self_id)"
+  top="$(git rev-parse --show-toplevel)"
+
+  # Verify per-worktree git user.name matches self
+  local current_name
+  current_name="$(git config user.name 2>/dev/null || echo "")"
+  if [[ "$current_name" != "$self" ]]; then
+    echo "syncgit: this worktree's git user.name (\"$current_name\") is not \"$self\"" >&2
+    echo "  squash needs author-based filtering. Either:" >&2
+    echo "    - run: git config --worktree user.name \"$self\"" >&2
+    echo "    - or re-run 'syncgit init' to set it automatically" >&2
+    exit 1
+  fi
+
+  # Find boundary: most recent outbound ref for self, or seed commit if none
+  local since
+  since="$(git for-each-ref --sort=-committerdate \
+               "refs/pr/$self/" --format='%(refname)' | head -1)"
+  if [[ -z "$since" ]]; then
+    since="$(git rev-list --max-parents=0 HEAD | tail -1)"
+  fi
+
+  # Count self-authored commits in range
+  local n
+  n="$(git rev-list "$since..HEAD" --author="^$self <" --count)"
+  if [[ "$n" -eq 0 ]]; then
+    echo "syncgit: nothing to squash (no self-authored commits since $since)"
+    return 0
+  fi
+  if [[ "$n" -eq 1 ]]; then
+    echo "syncgit: only one self-authored commit since last push; nothing to squash"
+    return 0
+  fi
+
+  # Refuse dirty working tree
+  if ! git diff --quiet || ! git diff --cached --quiet; then
+    echo "syncgit: working tree is dirty; commit or stash first" >&2
+    exit 1
+  fi
+
+  # Refuse if range contains peer or merge commits (simple path only)
+  local total_n mixed merges
+  total_n="$(git rev-list "$since..HEAD" --count)"
+  mixed=$(( total_n - n ))
+  merges="$(git rev-list --merges "$since..HEAD" --count)"
+  if [[ "$mixed" -gt 0 || "$merges" -gt 0 ]]; then
+    echo "syncgit: $since..HEAD contains peer or merge commits" >&2
+    echo "  squash only handles ranges of pure self-authored linear commits." >&2
+    echo "  Run 'syncgit push' first to broadcast, then squash on a fresh range." >&2
+    exit 1
+  fi
+
+  # Snapshot for abort recovery
+  git update-ref refs/syncgit/pre-squash HEAD
+  git rev-parse --abbrev-ref HEAD > "$top/.syncgit/pre-squash-branch"
+
+  current_branch="$(git rev-parse --abbrev-ref HEAD)"
+
+  # Build squash commit message
+  local squash_msg
+  squash_msg="syncgit: squash $n commits since $(basename "$since")
+
+$(git log --reverse --format='- %s' "$since..HEAD" --author="^$self <")"
+
+  # Squash: commit-tree the current tree with $since as parent
+  local tree new_tip
+  tree="$(git rev-parse HEAD^{tree})"
+  new_tip="$(echo "$squash_msg" | git commit-tree "$tree" -p "$since")"
+
+  git update-ref "refs/heads/$current_branch" "$new_tip"
+  git reset --hard "$new_tip"
+
+  # Clean up snapshot on success
+  git update-ref -d refs/syncgit/pre-squash
+  rm -f "$top/.syncgit/pre-squash-branch"
+
+  echo "syncgit: squashed $n commits into $(git rev-parse --short HEAD)"
 }
 
 main() {
@@ -247,6 +586,10 @@ main() {
     merge)  cmd_merge "$@" ;;
     verify) cmd_verify "$@" ;;
     push)   cmd_push "$@" ;;
+    gc)     cmd_gc "$@" ;;
+    show)   cmd_show "$@" ;;
+    abort)  cmd_abort "$@" ;;
+    squash) cmd_squash "$@" ;;
     ""|-h|--help|help) usage ;;
     *) echo "syncgit: unknown command $cmd" >&2; usage; exit 1 ;;
   esac
